@@ -25,7 +25,7 @@ def define_targets(targets: str, ago: str) -> List[str]:
     with open(targets, 'r') as f:
         # Skip header and process in one pass
         genes = [
-            line.strip().split("\t")[1] 
+            line.strip().split("\t")[1].split(",")[0]
             for line in f 
             if not line.startswith("ago") and line.strip().split("\t")[0] == ago
         ]
@@ -103,25 +103,73 @@ def group_and_agg_dist(df: pd.DataFrame, dist_col: str) -> pd.DataFrame:
     - Use more efficient pandas operations
     - Vectorized calculations
     """
-    grped = df.groupby(dist_col, as_index=False).agg({
-        'sense_rpm': 'sum',
-        'anti_rpm': 'sum'
-    })
+    df['dist_col'] = df[dist_col]
+
+    df = df.query('dist_col >= 0 and dist_col <= 22').reset_index(drop = True)
+
+    grped = df.groupby(dist_col, as_index=False).agg(
+        sense_rpm = ('sense_rpm', 'sum'), 
+        anti_rpm = ('anti_rpm', 'sum'), 
+        frequency = ('dist_col', 'size'))
     
     # Vectorized z-score calculations
     sense_mean = grped['sense_rpm'].mean()
     sense_std = grped['sense_rpm'].std(ddof=0)
     anti_mean = grped['anti_rpm'].mean()
     anti_std = grped['anti_rpm'].std(ddof=0)
-    
+    freq_mean = grped['frequency'].mean()
+    freq_std = grped['frequency'].std(ddof=0)
+
     grped['sense_zscore'] = 2 ** ((grped['sense_rpm'] - sense_mean) / sense_std)
     grped['anti_zscore'] = 2 ** ((grped['anti_rpm'] - anti_mean) / anti_std)
-    
+    grped['frequency_zscore'] = 2 ** ((grped['anti_rpm'] - freq_mean) / freq_std)
+
     grped = grped.rename(columns={dist_col: 'dist'})
+
     grped['id'] = dist_col
     
     return grped
 
+
+def filter_one_to_one_pairs(dat: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keep only one-to-one overlaps:
+      - each anti overlaps exactly one sense
+      - each sense overlaps exactly one anti
+    """
+    # unique IDs per fragment
+    dat["sense_id"] = (
+        dat["gene"].astype(str) + ":" +
+        dat["sense_5p"].astype(str) + "-" +
+        dat["sense_3p"].astype(str)
+    )
+    dat["anti_id"] = (
+        dat["gene"].astype(str) + ":" +
+        dat["anti_5p"].astype(str) + "-" +
+        dat["anti_3p"].astype(str)
+    )
+
+    # counts of distinct partners
+    anti_to_sense = (
+        dat.groupby("anti_id")["sense_id"]
+        .nunique()
+        .rename("anti_sense_n")
+    )
+    sense_to_anti = (
+        dat.groupby("sense_id")["anti_id"]
+        .nunique()
+        .rename("sense_anti_n")
+    )
+
+    dat = dat.merge(anti_to_sense, on="anti_id", how="left")
+    dat = dat.merge(sense_to_anti, on="sense_id", how="left")
+
+    # keep only strict one-to-one
+    dat_clean = dat[(dat["anti_sense_n"] <= 5) & (dat["sense_anti_n"]  <= 5)].copy()
+
+    # (optional) drop helper cols
+    dat_clean.drop(columns=["sense_id", "anti_id", "anti_sense_n", "sense_anti_n"], inplace=True)
+    return dat_clean
 
 def calc_p_distance(intersect: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -153,13 +201,21 @@ def calc_p_distance(intersect: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         dtype=dtypes,
         engine='c'  # Use faster C engine
     )
-    
+
+    #dat = filter_one_to_one_pairs(dat)
+
     # Vectorized calculations
     dat['5pto5p'] = dat['anti_5p'] - dat['sense_5p']
     dat['5pto3p'] = dat['anti_5p'] - dat['sense_3p'] + 1
     dat['sense_len'] = dat['sense_seq'].str.len()
     dat['anti_len'] = dat['anti_seq'].str.len()
     dat['anti_5p_nt'] = dat['anti_seq'].str[0]
+
+    #dat_5p5p = dat[['5pto5p', 'sense_rpm', 'anti_rpm']].query('5pto5p <= 22 & 5pto5p >= 0').rename(columns = { 'dist' : '5pto5p'})
+    
+    #dat_5p3p = dat[['5pto3p', 'sense_rpm', 'anti_rpm']].query('5pto3p <= 22 & 5pto3p >= 0').rename(columns = { 'dist' : '5pto3p'})
+
+    #dat = pd.concat([dat_5p5p, dat_5p3p], ignore_index=True)
     
     # Process groups
     grouped_5p5p = group_and_agg_dist(dat, '5pto5p')
@@ -418,13 +474,15 @@ if __name__ == "__main__":
     
     # Your existing sample_map and fasta setup here
     target_list = '/fs/ess/PCON0160/ben/projects/2023_claycomb_argonomics/target_lists.txt'
+    #target_list = '/fs/ess/PCON0160/ben/projects/2025_csr1_cleavage/AGO_cleavage_analysis/CSR1_targets_with_enriched_sense_reads.tsv'
     fasta = "/fs/ess/PCON0160/ben/genomes/c_elegans/WS279/ce_ws279.linc.pseudo.pc.repbase.fa"
     fp = "/fs/ess/PCON0160/ben/projects/2025_CSR_Y57_Y54/results/20251105/transcripts/bed"
 
     sample_map = [  
         # csr-1
         [ 'CSR-1', target_list, glob_files(fp, "*CSR*input*.bed.tsv"), glob_files(fp, "*CSR*IP*.bed.tsv") ],
-        [ 'CSR-1', target_list, glob_files("/fs/ess/PCON0160/ben/projects/2025_csr1_cleavage/00AA_AGO_cleavage/20250429/transcripts/bed", "*input*bed.tsv"), glob_files("/fs/ess/PCON0160/ben/projects/2025_csr1_cleavage/00AA_AGO_cleavage/20250429/transcripts/bed", "*IP*bed.tsv")]
+        [ 'CSR-1', target_list, glob_files("/fs/ess/PCON0160/ben/projects/2025_csr1_cleavage/00AA_AGO_cleavage/20250429/transcripts/bed", "*input*bed.tsv"), glob_files("/fs/ess/PCON0160/ben/projects/2025_csr1_cleavage/00AA_AGO_cleavage/20250429/transcripts/bed", "*IP*bed.tsv")],
+        [ 'CSR-1', target_list, glob_files("/fs/ess/PCON0160/ben/projects/2025_csr1_cleavage/00AA_AGO_cleavage/20250421/transcripts/bed", "*csr1tor104csr1_exon1::GFP::Flag*input*bed.tsv"), glob_files("/fs/ess/PCON0160/ben/projects/2025_csr1_cleavage/00AA_AGO_cleavage/20250421/transcripts/bed", "*csr1tor104csr1_exon1::GFP::Flag*IP*bed.tsv")],
     ]
 
     run_all(sample_map, fasta, use_parallel=args.parallel, n_jobs=args.jobs)

@@ -1,2 +1,4 @@
 *.tsv
 *.bed
+*.ipynb_checkpoints
+.ipynb_checkpoints/*
